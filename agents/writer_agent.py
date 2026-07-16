@@ -16,6 +16,7 @@ from agents.base_agent import (
     add_audit,
     add_error,
     add_trace,
+    call_with_retry,
     check_runaway,
     get_llm,
     increment_step,
@@ -52,7 +53,7 @@ Writing standards:
 - Use bullet points for enumerated lists. Use prose for analysis and synthesis.
 - Include a competitor comparison table (markdown format) whenever 2+ competitors have comparable data points.
 - Actionable recommendations must be specific: "Consider launching a mid-market pricing tier at $X/seat to counter Y's recent discount" not "Consider improving pricing strategy."
-- Maximum section length: 400 words or 8 bullet points. Be concise."""
+- Each section should be thorough and complete — aim for 400-600 words of substantive analysis per section. Do NOT truncate or summarize prematurely. Cover all relevant data points from the context."""
 
 
 # ── Context helpers ───────────────────────────────────────────────────────────
@@ -124,52 +125,76 @@ def _build_context(
     analysis: Optional[AnalysisResult],
     verification: Optional[VerificationResult],
 ) -> str:
-    """Assemble a rich context string for the LLM from all pipeline outputs."""
+    """Assemble a rich context string for the LLM from all pipeline outputs.
 
-    # Verified claims — sorted by confidence descending
+    Structure (priority order):
+    1. ANALYST SYNTHESES — pre-digested per-section narratives from the second
+       LLM pass in the Analyst Agent.  These are the primary input.  The Writer
+       compresses each one into its ~100-word section output.
+    2. HIGH-PRIORITY CLAIMS — verified or high-confidence claims to supplement
+       any section where synthesis is thin.
+    3. Supporting detail — competitor profiles, signals, source summaries — so
+       the Writer can pull in extra specifics if needed.
+    """
+
+    # ── 1. Analyst section syntheses (primary) ────────────────────────────────
+    syntheses: dict = {}
+    if analysis and analysis.section_syntheses:
+        syntheses = analysis.section_syntheses
+    if syntheses:
+        synth_lines = "\n\n".join(
+            f"[{key.upper().replace('_', ' ')}]\n{text}"
+            for key, text in syntheses.items()
+        )
+        synth_block = f"=== ANALYST SECTION SYNTHESES (primary — use these as your core input) ===\n{synth_lines}"
+    else:
+        synth_block = (
+            "=== ANALYST SECTION SYNTHESES ===\n"
+            "Not available — use the raw claims and signals below."
+        )
+
+    # ── 2. High-priority claims ────────────────────────────────────────────────
     verified = sorted(
         verification.verified_claims if verification else [],
         key=lambda c: c.confidence,
         reverse=True,
     )
-    verified_text = _claims_text(verified, "verified")
-
-    # Unverified claims
     unverified = verification.unverified_claims if verification else []
+    all_claims = verified + unverified
+    high_priority = [
+        c for c in all_claims
+        if getattr(c, "strategic_importance", "medium") == "high" or c.confidence >= 0.8
+    ][:10]
+    high_priority_text = _claims_text(high_priority, "high-priority") if high_priority else "None flagged."
+
+    verified_text  = _claims_text(verified,   "verified")
     unverified_text = _claims_text(unverified, "unverified")
 
-    # Competitor profiles — full detail
+    # ── 3. Competitor profiles + signals ──────────────────────────────────────
     competitors_text = _competitor_profiles_text(analysis)
 
-    # Market signals & trends
     signals: List[str] = []
     tech_trends: List[str] = []
     customer_trends: List[str] = []
     market_movements: List[str] = []
     if analysis:
-        signals = analysis.market_signals[:12]
-        tech_trends = analysis.technology_trends[:8]
+        signals        = analysis.market_signals[:12]
+        tech_trends    = analysis.technology_trends[:8]
         customer_trends = analysis.customer_trends[:8]
         market_movements = getattr(analysis, "market_movements", [])[:8]
-    signals_text = "\n".join(f"- {s}" for s in signals) or "No market signals identified."
-    tech_text = "\n".join(f"- {t}" for t in tech_trends) or "No technology trends identified."
-    customer_text = "\n".join(f"- {t}" for t in customer_trends) or "No customer trends identified."
+
+    signals_text   = "\n".join(f"- {s}" for s in signals)   or "No market signals identified."
+    tech_text      = "\n".join(f"- {t}" for t in tech_trends) or "No technology trends identified."
+    customer_text  = "\n".join(f"- {t}" for t in customer_trends) or "No customer trends identified."
     movements_text = "\n".join(f"- {m}" for m in market_movements) or "No market movements identified."
 
-    # Source summaries — top 8
     sources_text = _source_summaries_text(research)
 
-    # High-importance claims flagged separately
-    high_priority = [
-        c for c in (verified + unverified)
-        if getattr(c, "strategic_importance", "medium") == "high" or c.confidence >= 0.8
-    ][:10]
-    high_priority_text = _claims_text(high_priority, "high-priority") if high_priority else "None flagged."
-
     return (
-        f"=== HIGH-PRIORITY FINDINGS (use these first) ===\n{high_priority_text}\n\n"
-        f"=== VERIFIED CLAIMS ===\n{verified_text}\n\n"
-        f"=== UNVERIFIED CLAIMS (include with 'unconfirmed reports' language) ===\n{unverified_text}\n\n"
+        f"{synth_block}\n\n"
+        f"=== HIGH-PRIORITY CLAIMS (supplement syntheses where needed) ===\n{high_priority_text}\n\n"
+        f"=== ALL VERIFIED CLAIMS ===\n{verified_text}\n\n"
+        f"=== UNVERIFIED CLAIMS (use 'Unconfirmed —' prefix) ===\n{unverified_text}\n\n"
         f"=== COMPETITOR PROFILES ===\n{competitors_text}\n\n"
         f"=== MARKET SIGNALS ===\n{signals_text}\n\n"
         f"=== TECHNOLOGY TRENDS ===\n{tech_text}\n\n"
@@ -213,14 +238,19 @@ def _write_section(
     def _call(instruction_override: str) -> str:
         user_msg = (
             f"Topic: {topic}\n\n"
-            f"Context:\n{context[:8000]}\n\n"
+            f"Context:\n{context[:12000]}\n\n"
             f"Task: Write the '{section_name}' section. {instruction_override}\n"
-            f"Keep it to 4-6 paragraphs or a focused bullet list. Be specific and analytical."
+            f"Write a thorough, complete section. Use multiple paragraphs and bullet lists as needed. Cover every relevant data point from the context. Be specific, analytical, and comprehensive — do not truncate or summarise prematurely."
         )
-        response = llm.invoke([
-            SystemMessage(content=_SYSTEM_PROMPT),
-            HumanMessage(content=user_msg),
-        ])
+        response = call_with_retry(
+            lambda: llm.invoke([
+                SystemMessage(content=_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ]),
+            max_retries=3,
+            base_delay=5.0,
+            label=section_name,
+        )
         return response.content.strip()
 
     try:
@@ -317,13 +347,14 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 1: Executive Summary ───────────────────────────────────────
         executive_summary = write(
             "Executive Summary",
-            "Write a 3-paragraph executive summary that a VP of Strategy can act on immediately. "
-            "Paragraph 1: The single most important competitive development and its strategic implication. "
-            "Paragraph 2: The 2-3 most significant competitor moves (with names, specific actions, and why they matter). "
-            "Paragraph 3: The top strategic recommendation and the most critical risk to monitor. "
-            "Use specific competitor names, product names, and numbers. "
+            "Write a comprehensive executive summary that a VP of Strategy can act on immediately. "
+            "Paragraph 1: The single most important competitive development and its strategic implication — explain WHY it matters and what the downstream effect is. "
+            "Paragraph 2: The top 3-5 most significant competitor moves with names, specific actions, dates, and why each matters strategically. "
+            "Paragraph 3: Key market trends and forces shaping the competitive landscape right now. "
+            "Paragraph 4: The top strategic recommendations and the most critical risks to monitor. "
+            "Use specific competitor names, product names, numbers, and market data throughout. "
             "Mark any unconfirmed findings as 'According to unconfirmed reports...' "
-            "Do NOT write generic filler. If data is limited, state that clearly and summarize what IS known.",
+            "Aim for 300-500 words of substantive content.",
             fallback=(
                 f"The research pipeline retrieved {len(research.sources) if research else 0} sources on the topic "
                 f"'{topic}'. The LLM analysis was unable to generate a full summary. "
@@ -336,12 +367,14 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 2: Competitor Pricing ──────────────────────────────────────
         competitor_pricing = write(
             "Competitor Pricing Analysis",
-            "Analyze pricing strategies across ALL identified competitors. "
+            "Write a comprehensive pricing analysis covering ALL identified competitors. "
             "1. Start with a comparison table (markdown) if 2+ competitors have pricing data: columns = Competitor | Pricing Model | Key Tier | Price Point | Recent Change. "
-            "2. After the table, analyze the strategic implications: who is discounting aggressively, who is moving upmarket, what pricing pressure this creates. "
-            "3. Identify any pricing anomalies or opportunities (e.g., 'No competitor offers a $X/month mid-market tier — this is a gap'). "
-            "4. Mark any unconfirmed pricing data as 'Unconfirmed:' "
-            "If no specific pricing data was found, state: 'Specific pricing data was not retrievable from available sources. Based on public positioning: [summarize what is known about pricing strategy].'",
+            "2. After the table, provide deep analysis: who is discounting aggressively, who is moving upmarket, what pricing pressure this creates, and how it affects buyer decisions. "
+            "3. Analyse each competitor's pricing strategy in detail — what it signals about their positioning and growth targets. "
+            "4. Identify pricing anomalies or gaps (e.g., 'No competitor offers a $X/month mid-market tier — this is a white space opportunity'). "
+            "5. Discuss the impact of AI-tier pricing specifically as this is a major differentiator right now. "
+            "6. Mark any unconfirmed pricing data as 'Unconfirmed:' "
+            "Aim for 400-600 words of substantive analysis.",
             fallback=(
                 "Specific pricing data could not be extracted from the available sources. "
                 "The research sources retrieved did not contain detailed pricing information. "
@@ -352,14 +385,15 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 3: Product Updates ─────────────────────────────────────────
         product_updates = write(
             "Competitor Product & AI Capability Updates",
-            "Summarize recent product launches, AI/ML feature releases, platform updates, and technology bets per competitor. "
-            "1. Organize by competitor (use subheadings or bold competitor names). "
-            "2. For each product launch or AI capability: name it specifically, state when it launched (if known), and explain its competitive significance. "
-            "3. Identify capability gaps: 'Competitor X has launched Y — we do not currently have an equivalent.' "
-            "4. Note any partnerships or integrations that expand competitive reach. "
-            "5. Highlight AI-specific capabilities (copilots, automation, generative AI features) as these are currently the highest-stakes competitive differentiator. "
+            "Write a comprehensive section covering recent product launches, AI/ML feature releases, platform updates, and technology bets per competitor. "
+            "1. Organise by competitor (use bold competitor names or subheadings). "
+            "2. For each product launch or AI capability: name it specifically, state when it launched (if known), describe what it does, and explain its competitive significance in detail. "
+            "3. Analyse AI-specific capabilities (copilots, automation, generative AI, agentic features) with depth — these are the highest-stakes differentiators. "
+            "4. Identify capability gaps explicitly: 'Competitor X has launched Y — this creates a capability gap that could affect customer retention in segment Z.' "
+            "5. Cover platform integrations, ecosystem expansions, and technology partnerships. "
+            "6. Assess which competitor is moving fastest on the AI roadmap and what that means. "
             "Mark unconfirmed items as 'Unconfirmed:' "
-            "Never write 'No analysis could be generated' — if data is thin, summarize what IS available.",
+            "Aim for 400-600 words of thorough analysis.",
             fallback=(
                 "Product update data was limited in the available source articles. "
                 "The sources retrieved cover the general market landscape but did not contain specific product launch announcements. "
@@ -370,14 +404,15 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 4: Market Signals ──────────────────────────────────────────
         market_signals = write(
             "Market Signals & Trends",
-            "Synthesize the key market signals, technology trends, and customer behavior shifts. "
-            "1. Lead with the 2-3 strongest signals (those with the most evidence). "
-            "2. For each signal: state the observation, explain what is driving it, and describe the strategic implication. "
-            "3. Distinguish between: (a) confirmed trends with multiple sources, (b) emerging signals with limited evidence. "
-            "4. Include AI/automation adoption trends specifically — these are transforming competitive dynamics. "
-            "5. Note any customer behavior shifts (e.g., preference for vertical-specific solutions, demand for AI-native tools). "
+            "Write a comprehensive analysis of key market signals, technology trends, and customer behavior shifts. "
+            "1. Lead with the 3-5 strongest signals, each supported by specific evidence from the sources. "
+            "2. For EACH signal: state the observation in detail, explain the underlying drivers, describe the strategic implication, and assess who benefits or loses. "
+            "3. Provide a deep analysis of AI/automation adoption trends — adoption rates, customer willingness to pay, integration challenges, and who is leading. "
+            "4. Cover customer behavior shifts in detail: what buyers are prioritising, which segments are growing fastest, what is causing churn or switching. "
+            "5. Analyse macro forces: market size data, growth rates, M&A activity, regulatory changes, and funding trends. "
+            "6. Distinguish clearly between confirmed trends (multiple sources) and emerging signals (limited evidence). "
             "Mark any unconfirmed signals. "
-            "If signals are limited, state the confidence level and recommend additional research areas.",
+            "Aim for 400-600 words of substantive analysis.",
             fallback=(
                 "Market signal analysis was constrained by the content retrievable from available sources. "
                 "The research pipeline identified relevant sources but was unable to extract detailed market signals from their text content. "
@@ -388,15 +423,17 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 5: Business Risks ──────────────────────────────────────────
         business_risks = write(
             "Business Risks",
-            "Identify and rank the top business risks from the competitive landscape. "
-            "Format: use a numbered list ranked from highest to lowest severity. "
-            "For each risk: (1) name the risk, (2) identify which competitor or trend creates it, "
-            "(3) estimate severity (High/Medium/Low) with brief justification, "
-            "(4) suggest a mitigation approach. "
-            "Categories to consider: pricing pressure, AI capability gap, talent competition, "
-            "market share loss, regulatory risk, platform lock-in by competitor ecosystem. "
+            "Write a comprehensive risk assessment identifying and ranking all material business risks from the competitive landscape. "
+            "Format: numbered list ranked from highest to lowest severity. "
+            "For EACH risk: "
+            "(1) Name the risk with a descriptive title. "
+            "(2) Describe the risk in detail — what is happening, which competitor or trend creates it, what the mechanism of harm is. "
+            "(3) Assess severity (High/Medium/Low) with specific justification — what is the potential business impact (revenue, market share, customer loss). "
+            "(4) State the timeline — is this an immediate threat (0-6 months), near-term (6-18 months), or strategic horizon (18+ months)? "
+            "(5) Provide a specific mitigation approach with concrete actions. "
+            "Cover all risk categories: pricing pressure, AI capability gaps, talent competition, market share loss, regulatory exposure, platform lock-in, ecosystem risks. "
             "Mark any unconfirmed risks as 'Unconfirmed risk:' "
-            "Be specific — 'risk of losing enterprise customers to Salesforce's Einstein GPT suite' is better than 'risk of losing customers to competitors.'",
+            "Aim for 6-9 detailed risks totalling 400-600 words.",
             fallback=(
                 "Risk identification was constrained by available source data. "
                 "General risks for this competitive landscape typically include: pricing pressure from incumbents, "
@@ -408,14 +445,16 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 6: Strategic Recommendations ──────────────────────────────
         strategic_recommendations = write(
             "Strategic Recommendations",
-            "Provide 5-7 specific, evidence-based strategic recommendations ranked by urgency. "
+            "Provide 7-10 specific, evidence-based strategic recommendations ranked by urgency and potential impact. "
             "Format each recommendation as: "
             "**[Priority: High/Medium/Low] Recommendation title** "
-            "Rationale: Why this is recommended, based on the specific competitive evidence above. "
-            "Action: The specific action to take (not vague). "
+            "Rationale: Explain in detail WHY this is recommended, citing the specific competitive evidence, data points, or market signal that makes this urgent. "
+            "Action: The specific, concrete action to take — name the product, team, budget, or partnership involved. "
+            "Expected Outcome: What competitive advantage or risk mitigation this achieves. "
             "Timeline: Immediate (0-30 days), Near-term (1-3 months), or Strategic (3-12 months). "
-            "Base ALL recommendations on evidence from the competitive data above. "
-            "Mark any recommendations based on unconfirmed data.",
+            "Base ALL recommendations on specific evidence from the competitive data above. "
+            "Mark any recommendations based on unconfirmed data. "
+            "Aim for 500-700 words of substantive, actionable guidance.",
             fallback=(
                 "Strategic recommendations require validated competitive data. "
                 "Based on the research conducted, the following general recommendations apply: "
@@ -428,15 +467,17 @@ def writer_node(state: BriefingState) -> BriefingState:
         # ── Section 7: Opportunities ──────────────────────────────────────────
         opportunities = write(
             "Market & Competitive Opportunities",
-            "Identify 4-6 concrete, evidence-based opportunities. "
-            "For each opportunity: "
-            "(1) State the opportunity specifically (what gap, segment, or capability is underserved). "
-            "(2) Cite the evidence (which competitor weakness, which market signal, which customer trend creates it). "
-            "(3) Estimate the size or urgency of the opportunity if data supports it. "
-            "(4) Note any first-mover advantage window. "
-            "Opportunity types to consider: pricing gaps, geographic expansion, underserved customer segment, "
-            "AI capability gap in competitor portfolio, partnership opportunity, acquisition target. "
-            "Mark speculative opportunities (limited evidence) as 'Potential opportunity (unconfirmed):'",
+            "Identify and analyse 5-8 concrete, evidence-based opportunities in detail. "
+            "For EACH opportunity: "
+            "(1) State the opportunity with a clear title and detailed description — what the gap is, what customer need is unmet, or what competitor weakness exists. "
+            "(2) Cite the specific evidence: which competitor weakness, market signal, customer trend, or data point reveals this opportunity. "
+            "(3) Estimate the size, urgency, or value of the opportunity where data supports it (market segment size, revenue potential, number of addressable customers). "
+            "(4) Assess the first-mover advantage window — how long before a competitor closes this gap? "
+            "(5) Suggest a concrete way to capture the opportunity. "
+            "Cover all opportunity types: pricing gaps, geographic expansion, underserved customer segments, "
+            "AI capability gaps in competitor portfolios, partnership plays, acquisition targets, vertical-specific niches. "
+            "Mark speculative opportunities (limited evidence) as 'Potential opportunity (unconfirmed):' "
+            "Aim for 400-600 words of substantive, evidence-backed analysis.",
             fallback=(
                 "Opportunity analysis requires validated competitive data. "
                 "Potential opportunity areas in this competitive landscape typically include: "

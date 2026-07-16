@@ -120,12 +120,12 @@ llm_config = LLMConfig(
     provider=os.getenv("LLM_PROVIDER", "openrouter"),
     model=os.getenv("LLM_MODEL", "openai/gpt-4o-mini"),
     temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
-    max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+    max_tokens=int(os.getenv("LLM_MAX_TOKENS", "8192")),
     request_timeout=int(os.getenv("REQUEST_TIMEOUT", "60")),
 )
 
 search_config = SearchConfig(
-    max_results=int(os.getenv("MAX_SEARCH_RESULTS", "10")),
+    max_results=int(os.getenv("MAX_SEARCH_RESULTS", "15")),
     max_retries=int(os.getenv("MAX_RETRIES", "3")),
     timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
 )
@@ -156,25 +156,58 @@ TAVILY_API_KEY: Optional[str] = os.getenv("TAVILY_API_KEY")
 LANGSMITH_API_KEY: Optional[str] = os.getenv("LANGSMITH_API_KEY")
 
 
+def _is_real_key(value: Optional[str]) -> bool:
+    """
+    Return True only if *value* looks like a real API key.
+    Filters out common placeholder strings that get left in .env files.
+    """
+    if not value:
+        return False
+    placeholders = {
+        "your_openai_api_key_here",
+        "your_openrouter_api_key_here",
+        "your_groq_api_key_here",
+        "your_tavily_api_key_here",
+        "your_langsmith_api_key_here",
+        "your_api_key_here",
+        "placeholder",
+        "changeme",
+        "xxxx",
+    }
+    stripped = value.strip().lower()
+    if stripped in placeholders:
+        return False
+    if stripped.startswith("your_") or stripped.endswith("_here"):
+        return False
+    # Must be at least 20 chars to be a real key
+    return len(stripped) >= 20
+
+
 def get_active_api_key() -> str:
-    """Return the first available LLM API key."""
-    if OPENROUTER_API_KEY:
-        return OPENROUTER_API_KEY
-    if OPENAI_API_KEY:
-        return OPENAI_API_KEY
-    if GROQ_API_KEY:
-        return GROQ_API_KEY
+    """
+    Return the first *real* LLM API key found, in priority order:
+    OpenRouter → Groq → OpenAI.
+
+    Placeholder values (e.g. 'your_openai_api_key_here') are skipped.
+    """
+    if _is_real_key(OPENROUTER_API_KEY):
+        return OPENROUTER_API_KEY  # type: ignore[return-value]
+    if _is_real_key(GROQ_API_KEY):
+        return GROQ_API_KEY  # type: ignore[return-value]
+    if _is_real_key(OPENAI_API_KEY):
+        return OPENAI_API_KEY  # type: ignore[return-value]
     raise EnvironmentError(
-        "No LLM API key found. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY in .env"
+        "No valid LLM API key found. Set OPENROUTER_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY "
+        "in your .env file (current OPENAI_API_KEY appears to be a placeholder)."
     )
 
 
 def get_llm_base_url() -> str:
     """Return the base URL for the active LLM provider."""
-    if OPENROUTER_API_KEY:
+    if _is_real_key(OPENROUTER_API_KEY):
         return "https://openrouter.ai/api/v1"
-    if GROQ_API_KEY:
-        llm_config.model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+    if _is_real_key(GROQ_API_KEY):
+        llm_config.model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
         return "https://api.groq.com/openai/v1"
     return "https://api.openai.com/v1"
 

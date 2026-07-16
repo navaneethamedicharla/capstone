@@ -23,6 +23,7 @@ from agents.base_agent import (
     add_audit,
     add_error,
     add_trace,
+    call_with_retry,
     check_runaway,
     get_llm,
     increment_step,
@@ -88,8 +89,8 @@ JSON schema:
 
 def _build_source_prompt(topic: str, source_title: str, source_url: str, source_text: str) -> str:
     """Build a per-source extraction prompt."""
-    # Trim text to stay within token budget (~3000 chars ≈ 750 tokens)
-    text = source_text[:3000].strip()
+    # Trim text to stay within token budget (~6000 chars ≈ 1500 tokens)
+    text = source_text[:6000].strip()
     return f"""Topic: {topic}
 
 Article Title: {source_title}
@@ -206,10 +207,15 @@ def _extract_from_source(
 
     try:
         prompt = _build_source_prompt(topic, source_title, source_url, source_text)
-        response = llm.invoke([
-            SystemMessage(content=_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ])
+        response = call_with_retry(
+            lambda: llm.invoke([
+                SystemMessage(content=_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]),
+            max_retries=3,
+            base_delay=5.0,
+            label=f"extract:{source_title[:40]}",
+        )
         raw = response.content or ""
         parsed = _parse_llm_json(raw)
 
@@ -307,6 +313,204 @@ def _fallback_extract(sources_data: List[Dict]) -> Tuple[List[Claim], List[str]]
 
 
 # ---------------------------------------------------------------------------
+# Second-pass synthesis: structured section narratives for the Writer
+# ---------------------------------------------------------------------------
+
+_SYNTHESIS_SYSTEM_PROMPT = """You are a senior competitive intelligence analyst. Your task is to synthesize extracted research findings into structured, section-by-section intelligence summaries.
+
+You will receive a list of extracted claims, competitor profiles, market signals, technology trends, and source summaries gathered from real research sources on a specific topic.
+
+For each report section, produce a rich, detailed analytical summary (~400 words) that:
+- Leads with the most important finding for that section, stated with specificity
+- Names specific competitors, products, numbers, percentages, and dates from the findings
+- Groups related facts into coherent analytical observations rather than listing them raw
+- Explains the strategic implication of each key finding — WHY it matters, not just WHAT happened
+- Compares competitors directly where data allows (e.g., "Salesforce's X undercuts HubSpot's Y by 30%")
+- Notes confidence level for key claims (Verified / Unconfirmed) where relevant
+- Covers ALL relevant data points from the provided findings — do not omit or truncate
+
+If the findings contain no relevant information for a section, write "Insufficient data in retrieved sources." — do not fabricate content.
+
+Return ONLY valid JSON — no prose before or after. Schema:
+{
+  "executive_summary": "string (~400 words)",
+  "competitor_pricing": "string (~400 words)",
+  "product_updates": "string (~400 words)",
+  "market_signals": "string (~400 words)",
+  "business_risks": "string (~400 words)",
+  "strategic_recommendations": "string (~400 words)",
+  "opportunities": "string (~400 words)"
+}"""
+
+
+def _build_synthesis_prompt(
+    topic: str,
+    claims: List[Claim],
+    profiles: List[CompetitorProfile],
+    market_signals: List[str],
+    technology_trends: List[str],
+    customer_trends: List[str],
+    market_movements: List[str],
+    sources_data: List[Dict],
+) -> str:
+    """Assemble the user message for the synthesis LLM call."""
+
+    # Claims grouped by category
+    def _fmt_claims(cat: str) -> str:
+        items = [c for c in claims if c.category == cat]
+        if not items:
+            return "  None."
+        return "\n".join(
+            f"  - {c.text} (confidence: {c.confidence:.0%})"
+            for c in items[:10]
+        )
+
+    # Competitor profiles summary
+    comp_lines: List[str] = []
+    for p in profiles[:8]:
+        parts = []
+        if p.pricing_changes:
+            parts.append("Pricing: " + "; ".join(p.pricing_changes[:3]))
+        if p.product_launches:
+            parts.append("Products: " + "; ".join(p.product_launches[:3]))
+        if p.competitive_advantages:
+            parts.append("AI/Tech: " + "; ".join(p.competitive_advantages[:3]))
+        if p.partnerships:
+            parts.append("Partnerships: " + "; ".join(p.partnerships[:2]))
+        if p.acquisitions:
+            parts.append("Acquisitions: " + "; ".join(p.acquisitions[:2]))
+        if p.business_risks:
+            parts.append("Risks: " + "; ".join(p.business_risks[:2]))
+        detail = " | ".join(parts) if parts else "Limited data."
+        comp_lines.append(f"  - {p.name}: {detail}")
+    comp_text = "\n".join(comp_lines) if comp_lines else "  None identified."
+
+    # Source snippets (first 300 chars of raw content)
+    src_lines: List[str] = []
+    for s in sources_data[:8]:
+        snippet = (s.get("text") or "")[:600].strip()
+        if snippet:
+            src_lines.append(f"  [{s.get('title', '')[:60]}]: {snippet}")
+    src_text = "\n".join(src_lines) if src_lines else "  None."
+
+    def _fmt_list(items: List[str], limit: int = 8) -> str:
+        return "\n".join(f"  - {x}" for x in items[:limit]) or "  None."
+
+    return f"""Topic: {topic}
+
+=== PRICING CLAIMS ===
+{_fmt_claims("pricing")}
+
+=== PRODUCT / AI FEATURE CLAIMS ===
+{_fmt_claims("product")}
+{_fmt_claims("technology")}
+
+=== MARKET / CUSTOMER CLAIMS ===
+{_fmt_claims("market")}
+{_fmt_claims("customer")}
+
+=== RISK CLAIMS ===
+{_fmt_claims("risk")}
+
+=== PARTNERSHIP / ACQUISITION CLAIMS ===
+{_fmt_claims("partnership")}
+{_fmt_claims("acquisition")}
+
+=== COMPETITOR PROFILES ===
+{comp_text}
+
+=== MARKET SIGNALS ===
+{_fmt_list(market_signals)}
+
+=== TECHNOLOGY TRENDS ===
+{_fmt_list(technology_trends)}
+
+=== CUSTOMER TRENDS ===
+{_fmt_list(customer_trends)}
+
+=== MARKET MOVEMENTS (M&A / Funding) ===
+{_fmt_list(market_movements)}
+
+=== SOURCE SNIPPETS (raw article text) ===
+{src_text}
+
+Synthesize all of the above into the 7 JSON section summaries described in the system prompt. Draw only from the findings above. Be specific and analytical."""
+
+
+def _synthesize_sections(
+    llm,
+    topic: str,
+    claims: List[Claim],
+    profiles: List[CompetitorProfile],
+    market_signals: List[str],
+    technology_trends: List[str],
+    customer_trends: List[str],
+    market_movements: List[str],
+    sources_data: List[Dict],
+) -> Dict[str, str]:
+    """
+    Call the LLM once with all extracted findings and produce a structured
+    dict of per-section synthesis narratives (~150 words each).
+
+    Returns an empty dict if the call fails — the Writer falls back
+    gracefully to the raw claim lists in that case.
+    """
+    empty: Dict[str, str] = {}
+
+    if not claims and not market_signals and not profiles:
+        logger.warning("[analyst] Skipping synthesis — no extracted data to synthesize.")
+        return empty
+
+    try:
+        prompt = _build_synthesis_prompt(
+            topic=topic,
+            claims=claims,
+            profiles=profiles,
+            market_signals=market_signals,
+            technology_trends=technology_trends,
+            customer_trends=customer_trends,
+            market_movements=market_movements,
+            sources_data=sources_data,
+        )
+        response = call_with_retry(
+            lambda: llm.invoke([
+                SystemMessage(content=_SYNTHESIS_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]),
+            max_retries=3,
+            base_delay=5.0,
+            label="synthesis",
+        )
+        raw = (response.content or "").strip()
+        parsed = _parse_llm_json(raw)
+
+        if not parsed:
+            logger.warning("[analyst] Synthesis LLM returned empty/unparseable JSON — raw: %s...", raw[:120])
+            return empty
+
+        # Validate keys; keep only expected section names
+        expected_keys = {
+            "executive_summary", "competitor_pricing", "product_updates",
+            "market_signals", "business_risks", "strategic_recommendations",
+            "opportunities",
+        }
+        result = {
+            k: str(v).strip()
+            for k, v in parsed.items()
+            if k in expected_keys and v and len(str(v).strip()) > 20
+        }
+        logger.info(
+            "[analyst] Synthesis complete — %d/%d sections populated",
+            len(result), len(expected_keys),
+        )
+        return result
+
+    except Exception as exc:
+        logger.warning("[analyst] Synthesis LLM call failed: %s — Writer will use raw claims.", exc)
+        return empty
+
+
+# ---------------------------------------------------------------------------
 # LangGraph node
 # ---------------------------------------------------------------------------
 
@@ -366,6 +570,7 @@ def analyst_node(state: BriefingState) -> BriefingState:
     all_competitor_names: List[str] = []
     llm_success_count = 0
     llm_fail_count = 0
+    llm = None  # initialised inside try block below; kept in scope for synthesis pass
 
     try:
         llm = get_llm()
@@ -469,6 +674,28 @@ def analyst_node(state: BriefingState) -> BriefingState:
         if c.category in ("acquisition", "funding")
     ))[:8]
 
+    # --- Second-pass LLM synthesis: produce structured section narratives ----
+    # This gives the Writer pre-digested intelligence per section rather than
+    # raw claim lists. Falls back gracefully if the LLM call fails.
+    section_syntheses: Dict[str, str] = {}
+    if llm is not None:
+        logger.info("[analyst] Running second-pass synthesis for %d claims...", len(all_claims))
+        section_syntheses = _synthesize_sections(
+            llm=llm,
+            topic=topic,
+            claims=all_claims,
+            profiles=profiles,
+            market_signals=market_signals,
+            technology_trends=technology_trends,
+            customer_trends=customer_trends,
+            market_movements=market_movements,
+            sources_data=sources_data,
+        )
+        if meta:
+            meta.tool_calls += 1
+    else:
+        logger.warning("[analyst] Skipping synthesis — LLM was not initialised (extraction failed).")
+
     result = AnalysisResult(
         competitor_profiles=profiles,
         extracted_claims=all_claims,
@@ -476,6 +703,7 @@ def analyst_node(state: BriefingState) -> BriefingState:
         technology_trends=technology_trends,
         customer_trends=customer_trends,
         market_movements=market_movements,
+        section_syntheses=section_syntheses,
     )
     state["analysis_result"] = result
 

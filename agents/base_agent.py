@@ -6,8 +6,9 @@ used by all agents in the pipeline.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from langchain_openai import ChatOpenAI
 
@@ -15,6 +16,51 @@ from agents.state import AgentStatus, AuditLogEntry, BriefingState, TraceEntry
 from config import get_active_api_key, get_llm_base_url, llm_config
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+def call_with_retry(
+    fn: Callable[[], T],
+    max_retries: int = 3,
+    base_delay: float = 5.0,
+    label: str = "",
+) -> T:
+    """
+    Call *fn* and retry on rate-limit (429) errors with exponential backoff.
+
+    Retries up to *max_retries* times. Delays: 5s, 10s, 20s (doubles each time).
+    On non-rate-limit errors, raises immediately.
+    On exhausted retries, re-raises the last exception.
+    """
+    delay = base_delay
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            msg = str(exc)
+            is_rate_limit = "429" in msg or "rate_limit" in msg.lower() or "rate limit" in msg.lower()
+            if not is_rate_limit:
+                raise
+            last_exc = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "[retry] Rate-limit hit%s — waiting %.0fs before retry %d/%d",
+                    f" ({label})" if label else "",
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(delay)
+                delay *= 2  # exponential backoff
+            else:
+                logger.warning(
+                    "[retry] Rate-limit hit%s — all %d retries exhausted",
+                    f" ({label})" if label else "",
+                    max_retries,
+                )
+    raise last_exc  # type: ignore[misc]
 
 
 def get_llm(temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> ChatOpenAI:

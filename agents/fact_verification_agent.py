@@ -24,6 +24,7 @@ from agents.base_agent import (
     add_audit,
     add_error,
     add_trace,
+    call_with_retry,
     check_runaway,
     get_llm,
     increment_step,
@@ -287,10 +288,15 @@ def fact_verification_node(state: BriefingState) -> BriefingState:
         for b_idx, batch in enumerate(batches):
             try:
                 prompt = _build_batch_prompt(batch, source_texts)
-                response = llm.invoke([
-                    SystemMessage(content=_SYSTEM_PROMPT),
-                    HumanMessage(content=prompt),
-                ])
+                response = call_with_retry(
+                    lambda: llm.invoke([
+                        SystemMessage(content=_SYSTEM_PROMPT),
+                        HumanMessage(content=prompt),
+                    ]),
+                    max_retries=3,
+                    base_delay=5.0,
+                    label=f"verify-batch-{b_idx+1}",
+                )
                 if meta:
                     meta.tool_calls += 1
 

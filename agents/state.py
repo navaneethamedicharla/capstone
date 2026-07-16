@@ -116,6 +116,11 @@ class AnalysisResult(BaseModel):
     technology_trends: List[str] = Field(default_factory=list)
     customer_trends: List[str] = Field(default_factory=list)
     market_movements: List[str] = Field(default_factory=list)
+    # Second-pass LLM synthesis: keyed by section name, value is a ~150-word
+    # structured narrative the Writer compresses into its ~100-word output.
+    # Keys: executive_summary, competitor_pricing, product_updates,
+    #       market_signals, business_risks, strategic_recommendations, opportunities
+    section_syntheses: Dict[str, str] = Field(default_factory=dict)
 
 
 # ── Verification models ───────────────────────────────────────────────────────

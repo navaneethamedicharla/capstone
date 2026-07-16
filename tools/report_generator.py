@@ -59,7 +59,6 @@ def build_markdown_report(
     citations: List[Citation],
     run_metadata: Optional[RunMetadata] = None,
     audit_summary: str = "",
-    unverified_texts: Optional[List[str]] = None,
 ) -> str:
     """
     Assemble a full Markdown report string from section strings.
@@ -80,17 +79,6 @@ def build_markdown_report(
     lines.append(_section("Business Risks", business_risks or "_No risks identified._"))
     lines.append(_section("Strategic Recommendations", strategic_recommendations or "_No recommendations._"))
     lines.append(_section("Opportunities", opportunities or "_No opportunities identified._"))
-
-    # Single unverified claims section — only appears once, after all sections
-    if unverified_texts:
-        notes = "\n".join(f"- {p}" for p in unverified_texts)
-        unverified_block = (
-            "_The following claims were extracted from research sources but could not be "
-            "directly confirmed in the retrieved article text. They are included for "
-            "awareness and should be validated before acting on them._\n\n"
-            f"{notes}"
-        )
-        lines.append(_section("Claims Requiring Validation", unverified_block))
 
     # References
     lines.append(format_references_section(citations))
@@ -159,13 +147,6 @@ def assemble_final_report(
     Returns:
         FinalReport object with all fields populated.
     """
-    # Do NOT annotate every section with unverified claims — that causes
-    # the same block to repeat 7 times. Instead, collect them for a single
-    # dedicated section appended after the main sections.
-    unverified_texts: List[str] = []
-    if verification and verification.unverified_claims:
-        unverified_texts = [c.text for c in verification.unverified_claims[:15]]
-
     # Confidence / coverage – safe defaults when verification is absent
     citation_coverage: float = verification.citation_coverage if verification else 0.0
     overall_confidence: float = verification.overall_confidence if verification else 0.0
@@ -182,7 +163,6 @@ def assemble_final_report(
         citations=citations,
         run_metadata=run_metadata,
         audit_summary=audit_summary,
-        unverified_texts=unverified_texts,
     )
 
     word_count = len(markdown.split())
