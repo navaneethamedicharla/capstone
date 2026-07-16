@@ -1,0 +1,53 @@
+# ============================================================
+# Competitive Intelligence Briefing Crew - Requirements
+# ============================================================
+# Install: pip install -r requirements.txt
+
+# ── Core LangChain / LangGraph ────────────────────────────────────────────────
+langgraph==0.2.62
+langchain==0.3.14
+langchain-core==0.3.29
+langchain-openai==0.2.14
+langchain-community==0.3.14
+langchain-text-splitters==0.3.4
+langchain-huggingface==0.1.2
+
+# ── LLM / OpenAI SDK ─────────────────────────────────────────────────────────
+openai==1.59.6
+
+# ── Web Search ────────────────────────────────────────────────────────────────
+duckduckgo-search==7.2.1
+tavily-python==0.5.0
+
+# ── Web scraping ─────────────────────────────────────────────────────────────
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# ── RAG / Vector Store ────────────────────────────────────────────────────────
+faiss-cpu==1.9.0.post1
+sentence-transformers==3.3.1
+
+# ── Document loaders ─────────────────────────────────────────────────────────
+PyMuPDF==1.25.1
+python-docx==1.1.2
+pdfminer.six==20231228
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+streamlit==1.41.1
+
+# ── Data / Config ─────────────────────────────────────────────────────────────
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# ── PDF export ────────────────────────────────────────────────────────────────
+reportlab==4.2.5
+markdown==3.7
+
+# ── Optional: better PDF export ───────────────────────────────────────────────
+# weasyprint==62.3      # Requires GTK runtime on Windows
+# xhtml2pdf==0.2.16
+
+# ── Logging / Utils ───────────────────────────────────────────────────────────
+urllib3==2.2.3
